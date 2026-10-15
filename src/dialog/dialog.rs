@@ -90,6 +90,7 @@ impl TransactionHandle {
 /// * `Notify` - Dialog received a NOTIFY request
 /// * `Info` - Dialog received an INFO request
 /// * `Options` - Dialog received an OPTIONS request
+/// * `Prack` - Dialog received a PRACK for a reliable provisional response
 /// * `Terminated` - Dialog has been terminated
 ///
 /// # Examples
@@ -124,6 +125,13 @@ pub enum DialogState {
     Message(DialogId, crate::sip::Request, TransactionHandle),
     Info(DialogId, crate::sip::Request, TransactionHandle),
     Options(DialogId, crate::sip::Request, TransactionHandle),
+    /// A PRACK that acknowledged a reliable provisional response this UAS
+    /// sent (RFC 3262 §3). Answer it through the handle, e.g. with the SDP
+    /// answer when the PRACK carries an offer (RFC 3262 §5); a handle dropped
+    /// without a reply answers `200 OK`. The PRACK, and a 2xx held back for
+    /// it, wait until the event is received and its handle answered or
+    /// dropped (at most 64*T1), so keep reading the state receiver.
+    Prack(DialogId, crate::sip::Request, TransactionHandle),
     Terminated(DialogId, TerminatedReason),
 }
 
@@ -330,6 +338,8 @@ pub struct DialogInner {
     pub(super) initial_request: Mutex<Request>,
     pub(super) supports_100rel: bool,
     pub(super) remote_reliable: Mutex<Option<RemoteReliableState>>,
+    /// Reliable provisional responses this UAS sent (RFC 3262 §3).
+    pub(super) local_reliable: Mutex<super::prack::LocalReliableState>,
     /// The last ACK received for an INVITE or re-INVITE this dialog answered
     /// (UAS role). Carries the answer when the 2xx carried the offer.
     pub(super) remote_ack: Mutex<Option<Request>>,
@@ -364,6 +374,7 @@ impl DialogState {
             | DialogState::Notify(id, _, _)
             | DialogState::Info(id, _, _)
             | DialogState::Options(id, _, _)
+            | DialogState::Prack(id, _, _)
             | DialogState::Refer(id, _, _)
             | DialogState::Message(id, _, _)
             | DialogState::Terminated(id, _) => id,
@@ -502,6 +513,7 @@ impl DialogInner {
             remote_contact: Mutex::new(None),
             supports_100rel,
             remote_reliable: Mutex::new(None),
+            local_reliable: Mutex::new(Default::default()),
             remote_ack: Mutex::new(None),
             server_connection: Mutex::new(None),
             dialback_target: Mutex::new(None),
@@ -1460,6 +1472,8 @@ impl DialogInner {
             | DialogState::Message(_, _, _)
             | DialogState::Info(_, _, _)
             | DialogState::Options(_, _, _) => DialogSnapshotState::Confirmed,
+            // An event, never stored as the dialog's state.
+            DialogState::Prack(_, _, _) => DialogSnapshotState::Early,
         };
 
         DialogSnapshot {
@@ -1569,6 +1583,7 @@ impl DialogInner {
             session_id: Mutex::new(snapshot.session_id),
             supports_100rel: snapshot.supports_100rel,
             remote_reliable: Mutex::new(None),
+            local_reliable: Mutex::new(Default::default()),
             remote_ack: Mutex::new(None),
             server_connection: Mutex::new(None),
             dialback_target: Mutex::new(None),
@@ -1699,6 +1714,7 @@ impl DialogInner {
             | DialogState::Notify(_, _, _)
             | DialogState::Info(_, _, _)
             | DialogState::Options(_, _, _)
+            | DialogState::Prack(_, _, _)
             | DialogState::Refer(_, _, _) => {
                 // Try to send state update, but don't fail if channel is closed
                 self.state_sender.send(state).ok();
@@ -1716,11 +1732,26 @@ impl DialogInner {
         self.state_sender.send(state).ok();
     }
 
-    #[cfg_attr(not(feature = "platform-tokio"), allow(unused_mut))]
+    /// Send the final response the application gives through the handle of a
+    /// `DialogState` event; `501 Not Implemented` when the handle is dropped
+    /// without one or none comes within 64*T1.
     pub async fn process_transaction_handle(
         &self,
         tx: &mut Transaction,
+        rx: TransactionCommandReceiver,
+    ) -> Result<()> {
+        self.process_transaction_handle_or(tx, rx, StatusCode::NotImplemented)
+            .await
+    }
+
+    /// [`Self::process_transaction_handle`] with `fallback` as the response
+    /// when the handle gives none.
+    #[cfg_attr(not(feature = "platform-tokio"), allow(unused_mut))]
+    pub(super) async fn process_transaction_handle_or(
+        &self,
+        tx: &mut Transaction,
         mut rx: TransactionCommandReceiver,
+        fallback: StatusCode,
     ) -> Result<()> {
         let timeout_duration = self.endpoint_inner.option.t1x64;
         let result = crate::platform::timeout(timeout_duration, async {
@@ -1752,12 +1783,22 @@ impl DialogInner {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) | Err(_) => {
                 let id = self.id.lock().to_string();
-                warn!(
-                    id,
-                    "{} handle dropped or timed out without final reply, returning 501",
-                    tx.original.method,
-                );
-                tx.reply(StatusCode::NotImplemented).await
+                if fallback.kind() == StatusCodeKind::Successful {
+                    debug!(
+                        id,
+                        "{} handle dropped without final reply, returning {}",
+                        tx.original.method,
+                        fallback,
+                    );
+                } else {
+                    warn!(
+                        id,
+                        "{} handle dropped or timed out without final reply, returning {}",
+                        tx.original.method,
+                        fallback.code(),
+                    );
+                }
+                tx.reply(fallback).await
             }
         }
     }
@@ -1776,6 +1817,7 @@ impl core::fmt::Display for DialogState {
             DialogState::Notify(id, _, _) => write!(f, "{}(Notify)", id),
             DialogState::Info(id, _, _) => write!(f, "{}(Info)", id),
             DialogState::Options(id, _, _) => write!(f, "{}(Options)", id),
+            DialogState::Prack(id, _, _) => write!(f, "{}(Prack)", id),
             DialogState::Refer(id, _, _) => write!(f, "{}(Refer)", id),
             DialogState::Message(id, _, _) => write!(f, "{}(Message)", id),
             DialogState::Terminated(id, reason) => write!(f, "{}(Terminated {:?})", id, reason),

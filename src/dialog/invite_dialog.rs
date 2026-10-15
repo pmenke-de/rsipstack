@@ -111,8 +111,77 @@ impl InviteDialog {
         Ok(())
     }
 
+    /// Whether the INVITE listed `100rel` in `Supported` or `Require`: for a
+    /// UAS, whether [`Self::reliable_provisional`] may be used (RFC 3262 §3);
+    /// for a UAC, whether our INVITE offered it.
+    pub fn supports_100rel(&self) -> bool {
+        self.inner.supports_100rel
+    }
+
+    /// Whether the INVITE listed `100rel` in `Require`. A UAS then MUST send
+    /// every provisional response other than 100 reliably, through
+    /// [`Self::reliable_provisional`] or [`Self::ringing_reliable`], or
+    /// reject the INVITE with `420 Bad Extension` (RFC 3262 §3).
+    pub fn requires_100rel(&self) -> bool {
+        self.inner.requires_100rel()
+    }
+
+    /// Send a provisional response (101..=199) to the INVITE reliably
+    /// (RFC 3262 §3). UAS only.
+    ///
+    /// The response carries `Require: 100rel` and an `RSeq` (random start
+    /// in 1..=2^31-1, one more for each further reliable provisional of the
+    /// INVITE) and moves the dialog to `Early` like [`Self::ringing`]. It is
+    /// retransmitted at T1, 2*T1, 4*T1, ... until the matching PRACK
+    /// arrives, which raises [`DialogState::Prack`]. Without a PRACK within
+    /// 64*T1 the INVITE is rejected with `500` and the dialog ends with
+    /// [`TerminatedReason::Timeout`].
+    ///
+    /// While this response carries a body (an offer or an answer) and is not
+    /// acknowledged, [`Self::accept`] holds its 2xx back and sends it once the
+    /// PRACK arrives (RFC 3262 §3, §5). A final response stops the
+    /// retransmission; a PRACK that arrives later is still answered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, and sends nothing, when the dialog is not a UAS
+    /// dialog, `status` is not in 101..=199, the INVITE did not list `100rel`
+    /// in `Supported` or `Require` ([`Self::supports_100rel`]), the INVITE
+    /// was already answered or ended, or an earlier reliable provisional
+    /// response is not acknowledged yet: RFC 3262 §3 allows only one at a
+    /// time, so wait for its [`DialogState::Prack`] before sending the next.
+    pub fn reliable_provisional(
+        &self,
+        status: StatusCode,
+        headers: Option<Vec<Header>>,
+        body: Option<Vec<u8>>,
+    ) -> Result<()> {
+        self.inner.send_reliable_provisional(status, headers, body)
+    }
+
+    /// [`Self::reliable_provisional`] with `180 Ringing`, or `183 Session
+    /// Progress` when a body is given, like [`Self::ringing`].
+    pub fn ringing_reliable(
+        &self,
+        headers: Option<Vec<Header>>,
+        body: Option<Vec<u8>>,
+    ) -> Result<()> {
+        let status = if body.is_some() {
+            StatusCode::SessionProgress
+        } else {
+            StatusCode::Ringing
+        };
+        self.reliable_provisional(status, headers, body)
+    }
+
     /// Accept the incoming INVITE with a `200 OK`.
     /// No-op for UAC dialogs.
+    ///
+    /// While a reliable provisional response with a body waits for its PRACK
+    /// (see [`Self::reliable_provisional`]), the 2xx is held back, the
+    /// dialog stays `Early`, and the 2xx goes out (moving to `WaitAck`) when
+    /// the PRACK arrives; if none arrives within 64*T1 the INVITE is
+    /// rejected with `500` instead.
     pub fn accept(&self, headers: Option<Vec<Header>>, body: Option<Vec<u8>>) -> Result<()> {
         if self.role() != TransactionRole::Server {
             return Ok(());
@@ -120,6 +189,9 @@ impl InviteDialog {
         let resp = self
             .inner
             .make_response(&self.initial_request(), StatusCode::OK, headers, body);
+        if !self.inner.release_final_response(&resp) {
+            return Ok(());
+        }
         self.inner
             .tu_sender
             .send(TransactionEvent::Respond(resp.clone()))?;
@@ -165,6 +237,7 @@ impl InviteDialog {
             headers,
             None,
         );
+        self.inner.release_final_response(&resp);
         self.inner
             .tu_sender
             .send(TransactionEvent::Respond(resp))
@@ -877,28 +950,7 @@ impl InviteDialog {
 
     async fn handle_prack(&mut self, tx: &mut Transaction) -> Result<()> {
         debug!(id = %self.id(), uri = %tx.original.uri, "received prack");
-
-        let rack_ok = tx.original.rack_value().is_some()
-            || tx
-                .original
-                .header_value("RAck")
-                .and_then(|value| {
-                    let mut items = value.split_whitespace();
-                    let rseq = items.next()?.parse::<u32>().ok()?;
-                    let cseq = items.next()?.parse::<u32>().ok()?;
-                    let method = items.next()?.parse::<Method>().ok()?;
-                    Some((rseq, cseq, method))
-                })
-                .is_some();
-
-        if !rack_ok {
-            warn!(id = %self.id(), "received PRACK without RAck header");
-            tx.reply(StatusCode::BadRequest).await?;
-            return Ok(());
-        }
-
-        tx.reply(StatusCode::OK).await?;
-        Ok(())
+        self.inner.handle_prack(tx).await
     }
 
     async fn handle_options(&mut self, tx: &mut Transaction) -> Result<()> {

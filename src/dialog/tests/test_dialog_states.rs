@@ -524,6 +524,7 @@ fn state_name(state: &DialogState) -> &'static str {
         DialogState::Notify(_, _, _) => "Notify",
         DialogState::Info(_, _, _) => "Info",
         DialogState::Options(_, _, _) => "Options",
+        DialogState::Prack(_, _, _) => "Prack",
         DialogState::Refer(_, _, _) => "Refer",
         DialogState::Message(_, _, _) => "Message",
         DialogState::Terminated(_, _) => "Terminated",

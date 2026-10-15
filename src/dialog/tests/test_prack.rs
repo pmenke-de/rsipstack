@@ -14,8 +14,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::time::{timeout, Duration};
 
+/// RFC 3262 §3: a PRACK that matches no unacknowledged reliable provisional
+/// response is answered with 481.
 #[tokio::test]
-async fn server_dialog_handles_prack_request() -> crate::Result<()> {
+async fn server_dialog_answers_unmatched_prack_with_481() -> crate::Result<()> {
     let endpoint = create_test_endpoint().await?;
     let (state_sender, _state_receiver) = unbounded_channel();
     let (tu_sender, _tu_receiver) = unbounded_channel();
@@ -95,7 +97,7 @@ async fn server_dialog_handles_prack_request() -> crate::Result<()> {
         .expect("transport event");
     match event {
         TransportEvent::Incoming(SipMessage::Response(resp), _, _) => {
-            assert_eq!(resp.status_code, StatusCode::OK);
+            assert_eq!(resp.status_code, StatusCode::CallTransactionDoesNotExist);
         }
         other => panic!("unexpected transport event: {other:?}"),
     }
