@@ -514,7 +514,29 @@ impl DialogLayer {
 
     pub fn match_dialog(&self, tx: &Transaction) -> Option<Dialog> {
         let id = DialogId::try_from(tx).ok()?;
-        self.get_dialog(&id)
+        if let Some(dialog) = self.get_dialog(&id) {
+            return Some(dialog);
+        }
+        // An early client dialog stays registered under its initial key,
+        // without a remote tag, until the INVITE's final response (see
+        // `do_invite_async`), while the dialog itself takes the peer's tag
+        // from the first provisional response. A request the peer sends in
+        // that early dialog (UPDATE, INFO, OPTIONS, …) carries the tag, so
+        // it is looked up by the initial key as well and accepted when the
+        // dialog's own id has caught up with the request.
+        let initial = DialogId {
+            call_id: id.call_id.clone(),
+            local_tag: id.local_tag.clone(),
+            remote_tag: String::new(),
+        };
+        match self.get_dialog(&initial)? {
+            Dialog::Invite(dialog)
+                if dialog.role() == TransactionRole::Client && dialog.id() == id =>
+            {
+                Some(Dialog::Invite(dialog))
+            }
+            _ => None,
+        }
     }
 
     pub fn new_dialog_state_channel(&self) -> (DialogStateSender, DialogStateReceiver) {
