@@ -671,6 +671,7 @@ impl DialogInner {
         let to_header = resp.to_header()?;
         if let Ok(Some(tag)) = to_header.tag() {
             self.update_remote_tag(tag.value())?;
+            self.update_remote_target_from_provisional(resp);
         }
 
         if let Some(prack) = self.prepare_prack_request(resp)? {
@@ -678,6 +679,31 @@ impl DialogInner {
         }
 
         Ok(())
+    }
+
+    /// Take the remote target from the Contact of a provisional response
+    /// that establishes an early dialog (RFC 3261 §12.1.2), so requests in
+    /// that dialog (the PRACK, RFC 3262 §4; an UPDATE) carry the callee's
+    /// Contact URI as Request-URI, as ACK and BYE do after the 2xx. Until
+    /// then the remote target is the INVITE's target (its `destination` or
+    /// Request-URI). A 1xx without Contact leaves it unchanged; the 2xx sets
+    /// it again.
+    fn update_remote_target_from_provisional(&self, resp: &Response) {
+        if self.role != TransactionRole::Client {
+            return;
+        }
+        let Ok(contact) = resp.contact_header() else {
+            return;
+        };
+        let Some(uri) = resp
+            .typed_contact_headers()
+            .ok()
+            .and_then(|c| c.first().map(|c| c.uri.clone()))
+        else {
+            return;
+        };
+        *self.remote_contact.lock() = Some(contact.clone());
+        *self.remote_uri.lock() = uri;
     }
 
     pub(super) async fn send_prack_request(&self, request: Request) -> Result<Option<Response>> {
