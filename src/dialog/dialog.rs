@@ -344,6 +344,11 @@ pub struct DialogInner {
     pub(super) cancel_requested: AtomicBool,
     /// That CANCEL waits for a provisional response (RFC 3261 §9.1).
     pub(super) cancel_deferred: AtomicBool,
+    /// Extra headers for that CANCEL (`cancel_with_headers`).
+    pub(super) cancel_headers: Mutex<Vec<Header>>,
+    /// Where this UAC dialog's INVITE was sent (the transaction's resolved
+    /// destination); its CANCEL goes there too (RFC 3261 §9.1).
+    pub(super) invite_destination: Mutex<Option<SipAddr>>,
 }
 
 pub type DialogStateReceiver = UnboundedReceiver<DialogState>;
@@ -507,6 +512,8 @@ impl DialogInner {
             dialback_target: Mutex::new(None),
             cancel_requested: AtomicBool::new(false),
             cancel_deferred: AtomicBool::new(false),
+            cancel_headers: Mutex::new(Vec::new()),
+            invite_destination: Mutex::new(None),
         })
     }
     /// Extract RFC 7989 Session-ID state from the initial request.
@@ -566,6 +573,12 @@ impl DialogInner {
         self.session_id.lock().clone()
     }
 
+    /// Record where the INVITE of this UAC dialog went, once its transaction
+    /// has sent it (and again for an INVITE resent with credentials). The
+    /// CANCEL follows it there.
+    pub(super) fn set_invite_destination(&self, destination: Option<SipAddr>) {
+        *self.invite_destination.lock() = destination;
+    }
     pub fn set_server_connection(&self, connection: Option<SipConnection>) {
         // Recorded for both roles: server dialogs get it at creation time,
         // client dialogs after the initial INVITE is sent (see
@@ -1140,6 +1153,14 @@ impl DialogInner {
                 tx.destination = SipAddr::try_from(&first_route.uri).ok();
             }
         }
+        // RFC 3261 §9.1: a CANCEL goes where its INVITE went, which may be
+        // an address the application gave (`InviteOption::destination`)
+        // rather than what the Request-URI resolves to.
+        if method == Method::Cancel {
+            if let Some(destination) = self.invite_destination.lock().clone() {
+                tx.destination = Some(destination);
+            }
+        }
         let need_fallback_retry;
         let mut send_error = None;
         match tx.send().await {
@@ -1574,6 +1595,8 @@ impl DialogInner {
             dialback_target: Mutex::new(None),
             cancel_requested: AtomicBool::new(false),
             cancel_deferred: AtomicBool::new(false),
+            cancel_headers: Mutex::new(Vec::new()),
+            invite_destination: Mutex::new(None),
         }))
     }
     fn build_restored_initial_request(
