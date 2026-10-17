@@ -292,7 +292,18 @@ impl InviteDialog {
     /// registered in the dialog layer. A challenge (401/407) is final.
     /// Once a final response arrived there is nothing to cancel: `Ok(())`.
     /// A UAS cannot send CANCEL: an error; end the INVITE with `reject()`.
+    ///
+    /// The CANCEL goes to where the INVITE was sent (RFC 3261 §9.1), also
+    /// when that was an `InviteOption::destination` other than what the
+    /// Request-URI resolves to.
     pub async fn cancel(&self) -> Result<()> {
+        self.cancel_with_headers(Vec::new()).await
+    }
+
+    /// [`cancel`](Self::cancel) with `headers` added to the CANCEL, e.g. a
+    /// `Reason` (RFC 3326). A deferred CANCEL keeps them until it is sent;
+    /// a later call before then replaces them.
+    pub async fn cancel_with_headers(&self, headers: Vec<Header>) -> Result<()> {
         if self.role() != TransactionRole::Client {
             return Err(crate::Error::DialogError(
                 "cancel is a UAC operation; use reject()".to_string(),
@@ -300,6 +311,7 @@ impl InviteDialog {
                 StatusCode::ServerInternalError,
             ));
         }
+        *self.inner.cancel_headers.lock() = headers;
         {
             // Decided under the state lock, so `process_invite` either sees
             // the deferred CANCEL after leaving Calling or we see it left.
@@ -347,7 +359,9 @@ impl InviteDialog {
         });
     }
 
-    /// Send the CANCEL for the initial INVITE, whatever the dialog state.
+    /// Send the CANCEL for the initial INVITE, whatever the dialog state,
+    /// with the headers `cancel_with_headers` stored, to where the INVITE
+    /// went.
     pub(super) async fn send_cancel(&self) -> Result<()> {
         debug!(id = %self.id(), "sending cancel request");
         let mut cancel_request = self.inner.initial_request.lock().clone();
@@ -362,6 +376,9 @@ impl InviteDialog {
             .mut_seq(invite_seq)?
             .mut_method(Method::Cancel)?;
         cancel_request.body = vec![];
+        for header in self.inner.cancel_headers.lock().iter() {
+            cancel_request.headers_mut().push(header.clone());
+        }
         let Some(response) = self.inner.do_request(cancel_request).await? else {
             return Ok(());
         };
@@ -407,6 +424,7 @@ impl InviteDialog {
         // in-dialog requests (BYE / re-INVITE / INFO) reuse it instead of
         // destination-routing off a possibly unroutable Contact.
         self.inner.set_server_connection(tx.connection.clone());
+        self.inner.set_invite_destination(tx.destination.clone());
         let mut dialog_id = self.id();
         let mut final_response = None;
         while let Some(msg) = tx.receive().await {
@@ -457,6 +475,7 @@ impl InviteDialog {
                             .await?;
                             tx.send().await?;
                             self.inner.set_server_connection(tx.connection.clone());
+                            self.inner.set_invite_destination(tx.destination.clone());
                             self.inner.update_remote_tag("").ok();
                             {
                                 let mut req = self.inner.initial_request.lock();
