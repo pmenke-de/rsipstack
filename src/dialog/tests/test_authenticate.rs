@@ -908,3 +908,66 @@ fn test_verify_digest_real_world_unify_udp() {
         "Real-world Unify UDP case should pass verification"
     );
 }
+
+/// The nonce count is up to 8 hex digits (RFC 7616 §3.4): values above `ff`
+/// parse, and the digest uses the value as the client sent it.
+#[test]
+fn test_verify_digest_with_nonce_count_above_ff() {
+    use crate::dialog::authenticate::verify_digest;
+    use crate::sip::headers::auth::AuthQop;
+    use md5::{Digest, Md5};
+
+    let md5 = |s: &str| {
+        Md5::digest(s.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let uri = "sip:pbx.example.com";
+    let nonce = "dcd98b7102dd2f0e8b11d0f600bfb0c093";
+    for nc in ["00000100", "0000000a", "ffffffff"] {
+        let ha1 = md5("alice:pbx.example.com:secret");
+        let ha2 = md5(&format!("REGISTER:{uri}"));
+        let response = md5(&format!("{ha1}:{nonce}:{nc}:0a4f113b:auth:{ha2}"));
+        let header = format!(
+            r#"Digest username="alice",realm="pbx.example.com",nonce="{nonce}",uri="{uri}",response="{response}",algorithm=MD5,qop=auth,nc={nc},cnonce="0a4f113b""#
+        );
+        let auth = crate::sip::typed::Authorization::parse(&header).unwrap();
+        let expected = u32::from_str_radix(nc, 16).unwrap();
+        assert_eq!(
+            auth.qop,
+            Some(AuthQop::Auth {
+                cnonce: "0a4f113b".into(),
+                nc: expected
+            })
+        );
+        assert!(
+            auth.qop
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains(&format!("nc={nc}")),
+            "nc={nc} must be written back as it was sent"
+        );
+        assert!(
+            verify_digest(&auth, "secret", &crate::sip::Method::Register, &header),
+            "a valid response with nc={nc} must verify"
+        );
+        let proxy = crate::sip::typed::ProxyAuthorization::parse(&header).unwrap();
+        assert_eq!(proxy.qop, auth.qop);
+    }
+}
+
+/// An `nc` that is not 1 to 8 hex digits is a parse error.
+#[test]
+fn test_nonce_count_rejects_malformed_values() {
+    for nc in ["", "000000001", "100000000", "+1", "0000000g"] {
+        let header = format!(
+            r#"Digest username="alice",realm="r",nonce="n",uri="sip:r",response="x",qop=auth,nc={nc},cnonce="c""#
+        );
+        assert!(
+            crate::sip::typed::Authorization::parse(&header).is_err(),
+            "nc={nc:?} must not parse"
+        );
+    }
+}

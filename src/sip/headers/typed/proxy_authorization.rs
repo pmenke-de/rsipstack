@@ -1,6 +1,6 @@
 use super::tokenizers::AuthTokenizer;
 use crate::prelude::*;
-use crate::sip::headers::auth::{Algorithm, AuthQop, Scheme};
+use crate::sip::headers::auth::{parse_nonce_count, Algorithm, AuthQop, Scheme};
 use crate::sip::{Error, Header, Uri};
 
 fn find_param<'a>(params: &[(&'a str, &'a str)], name: &str) -> Option<&'a str> {
@@ -19,21 +19,17 @@ fn find_qop(params: &[(&str, &str)]) -> Result<Option<AuthQop>, Error> {
             cnonce: find_param(params, "cnonce")
                 .ok_or_else(|| Error::InvalidParam("missing cnonce".into()))?
                 .into(),
-            nc: u8::from_str_radix(
+            nc: parse_nonce_count(
                 find_param(params, "nc").ok_or_else(|| Error::InvalidParam("missing nc".into()))?,
-                16,
-            )
-            .map_err(|_| Error::ParseError("nc parse error".into()))?,
+            )?,
         }),
         Some(q) if q.eq_ignore_ascii_case("auth-int") => Some(AuthQop::AuthInt {
             cnonce: find_param(params, "cnonce")
                 .ok_or_else(|| Error::InvalidParam("missing cnonce".into()))?
                 .into(),
-            nc: u8::from_str_radix(
+            nc: parse_nonce_count(
                 find_param(params, "nc").ok_or_else(|| Error::InvalidParam("missing nc".into()))?,
-                16,
-            )
-            .map_err(|_| Error::ParseError("nc parse error".into()))?,
+            )?,
         }),
         Some(q) => return Err(Error::InvalidParam(format!("unknown qop: {}", q))),
         None => None,

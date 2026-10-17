@@ -464,11 +464,11 @@ pub fn compute_digest(
 
     let value = match qop {
         Some(AuthQop::Auth { cnonce, nc }) => {
-            format!("{}:{}:{:08}:{}:{}:{}", ha1, nonce, nc, cnonce, "auth", ha2)
+            format!("{}:{}:{:08x}:{}:{}:{}", ha1, nonce, nc, cnonce, "auth", ha2)
         }
         Some(AuthQop::AuthInt { cnonce, nc }) => {
             format!(
-                "{}:{}:{:08}:{}:{}:{}",
+                "{}:{}:{:08x}:{}:{}:{}",
                 ha1, nonce, nc, cnonce, "auth-int", ha2
             )
         }

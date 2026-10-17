@@ -83,18 +83,30 @@ impl core::convert::TryFrom<&str> for Qop {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum AuthQop {
-    Auth { cnonce: String, nc: u8 },
-    AuthInt { cnonce: String, nc: u8 },
+    Auth { cnonce: String, nc: u32 },
+    AuthInt { cnonce: String, nc: u32 },
+}
+
+/// Parses a digest `nc` (nonce count) parameter: up to 8 hex digits
+/// (`8LHEX`, RFC 7616 §3.4 and RFC 2617 §3.2.2).
+pub(crate) fn parse_nonce_count(value: &str) -> Result<u32, crate::sip::Error> {
+    if value.is_empty() || value.len() > 8 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(crate::sip::Error::ParseError(format!(
+            "nc parse error: {value}"
+        )));
+    }
+    u32::from_str_radix(value, 16)
+        .map_err(|_| crate::sip::Error::ParseError(format!("nc parse error: {value}")))
 }
 
 impl core::fmt::Display for AuthQop {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Auth { cnonce, nc } => {
-                write!(f, "qop=\"auth\", nc={:08}, cnonce=\"{}\"", nc, cnonce)
+                write!(f, "qop=\"auth\", nc={:08x}, cnonce=\"{}\"", nc, cnonce)
             }
             Self::AuthInt { cnonce, nc } => {
-                write!(f, "qop=\"auth-int\", nc={:08}, cnonce=\"{}\"", nc, cnonce)
+                write!(f, "qop=\"auth-int\", nc={:08x}, cnonce=\"{}\"", nc, cnonce)
             }
         }
     }
