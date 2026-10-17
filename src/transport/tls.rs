@@ -236,7 +236,15 @@ pub struct TlsConfig {
     pub ca_certs: Option<Vec<u8>>,
     // SNI hostname for TLS client connections (overrides the hostname derived from the remote address)
     pub sni_hostname: Option<String>,
+    /// How long the listener waits for a client's TLS handshake after the
+    /// TCP accept. A connection that has not completed the handshake by
+    /// then is dropped. `None` means [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`].
+    pub handshake_timeout: Option<core::time::Duration>,
 }
+
+/// Default bound on a server-side TLS handshake (see
+/// [`TlsConfig::handshake_timeout`]).
+pub const DEFAULT_TLS_HANDSHAKE_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
 
 fn parse_private_key(key_data: &[u8]) -> Result<pki_types::PrivateKeyDer<'static>> {
     // Try PKCS8 format first
@@ -319,6 +327,11 @@ impl TlsListenerConnection {
         let (acceptor, resolver) = Self::create_acceptor(&self.inner.config).await?;
         *self.inner.cert_resolver.lock() = Some(resolver);
         let listener_local_addr = self.get_addr().clone();
+        let handshake_timeout = self
+            .inner
+            .config
+            .handshake_timeout
+            .unwrap_or(DEFAULT_TLS_HANDSHAKE_TIMEOUT);
 
         crate::platform::spawn(async move {
             loop {
@@ -345,11 +358,26 @@ impl TlsListenerConnection {
                 let local_addr = listener_local_addr.clone();
 
                 crate::platform::spawn(async move {
-                    // Perform TLS handshake
-                    let tls_stream = match acceptor_clone.accept(stream).await {
-                        Ok(stream) => stream,
-                        Err(e) => {
+                    // Perform the TLS handshake, bounded: a client that
+                    // connects and never completes it must not hold the task
+                    // and the socket forever.
+                    let tls_stream = match crate::platform::timeout(
+                        handshake_timeout,
+                        acceptor_clone.accept(stream),
+                    )
+                    .await
+                    {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(e)) => {
                             warn!(error = %e, "TLS handshake failed");
+                            return;
+                        }
+                        Err(_) => {
+                            debug!(
+                                remote = %remote_addr,
+                                timeout = ?handshake_timeout,
+                                "TLS handshake timed out, closing connection"
+                            );
                             return;
                         }
                     };
