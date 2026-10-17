@@ -193,3 +193,88 @@ async fn client_dialog_pracks_each_reliable_provisional() -> crate::Result<()> {
     token.cancel();
     Ok(())
 }
+
+/// RFC 3262 §4 / RFC 3261 §12.1.2: the PRACK is a request in the early
+/// dialog, so its Request-URI is the remote target, the Contact of the
+/// reliable 1xx (user part included), not the address the INVITE was sent
+/// to. The INVITE here goes to an explicit `destination`, as a proxy or a
+/// registrar sends to a registered binding.
+#[tokio::test]
+async fn client_prack_request_uri_is_the_provisional_contact() -> crate::Result<()> {
+    use crate::dialog::{dialog_layer::DialogLayer, invitation::InviteOption};
+    use crate::sip::prelude::HeadersExt;
+    use crate::transport::{udp::UdpConnection, TransportLayer};
+    use tokio::net::UdpSocket;
+    use tokio_util::sync::CancellationToken;
+
+    let token = CancellationToken::new();
+    let peer = UdpSocket::bind("127.0.0.1:0").await?;
+    let peer_addr = peer.local_addr()?;
+    let transport_layer = TransportLayer::new(token.child_token());
+    let udp = UdpConnection::create_connection(
+        "127.0.0.1:0".parse().unwrap(),
+        None,
+        Some(token.child_token()),
+    )
+    .await?;
+    let uac_addr = udp.get_addr().addr.clone();
+    transport_layer.add_transport(udp.into());
+    let endpoint = crate::EndpointBuilder::new()
+        .with_transport_layer(transport_layer)
+        .with_cancel_token(token.child_token())
+        .build();
+    let inner = endpoint.inner.clone();
+    tokio::spawn(async move { inner.serve().await });
+    let layer = DialogLayer::new(endpoint.inner.clone());
+    let option = InviteOption {
+        caller: crate::sip::Uri::try_from("sip:alice@example.com")?,
+        callee: crate::sip::Uri::try_from("sip:bob@example.com")?,
+        contact: crate::sip::Uri::try_from(format!("sip:alice@{uac_addr}").as_str())?,
+        destination: Some(SipAddr {
+            r#type: Some(crate::sip::Transport::Udp),
+            addr: crate::sip::HostWithPort::try_from(peer_addr.to_string().as_str())?,
+        }),
+        support_prack: true,
+        ..Default::default()
+    };
+    let (state_sender, _states) = unbounded_channel();
+    let invite = tokio::spawn(async move { layer.do_invite(option, state_sender).await });
+
+    let mut buf = vec![0u8; 4096];
+    let mut recv = async |method: Method| -> (Request, std::net::SocketAddr) {
+        loop {
+            let (len, from) = timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("timeout waiting for {method}"))
+                .unwrap();
+            let text = std::str::from_utf8(&buf[..len]).unwrap();
+            if let Ok(SipMessage::Request(req)) = SipMessage::try_from(text) {
+                if req.method == method {
+                    return (req, from);
+                }
+            }
+        }
+    };
+
+    let (inv, uac) = recv(Method::Invite).await;
+    assert_eq!(inv.uri.to_string(), "sip:bob@example.com");
+    let contact = format!("sip:bob-1234@{peer_addr}");
+    let progress = format!(
+        "SIP/2.0 183 Session Progress\r\nVia: {}\r\nFrom: {}\r\nTo: {};tag=bob\r\n\
+         Call-ID: {}\r\nCSeq: {}\r\nContact: <{contact}>\r\nRequire: 100rel\r\n\
+         RSeq: 1\r\nContent-Length: 0\r\n\r\n",
+        inv.via_header().unwrap().value(),
+        inv.from_header().unwrap().value(),
+        inv.to_header().unwrap().value(),
+        inv.call_id_header().unwrap().value(),
+        inv.cseq_header().unwrap().value(),
+    );
+    peer.send_to(progress.as_bytes(), uac).await?;
+    let (prack, _) = recv(Method::PRack).await;
+    assert_eq!(prack.uri.to_string(), contact);
+    assert_eq!(prack.uri.user(), Some("bob-1234"));
+
+    invite.abort();
+    token.cancel();
+    Ok(())
+}
