@@ -19,6 +19,13 @@ pub mod subscription;
 #[cfg(test)]
 mod tests;
 
+/// The `message/sipfrag` body of a REFER NOTIFY (RFC 3515 §2.4.5): the
+/// status line of the referred request's response, with the canonical
+/// reason phrase (`SIP/2.0 480 Temporarily Unavailable`).
+pub(crate) fn refer_sipfrag(status: &crate::sip::StatusCode) -> Vec<u8> {
+    format!("SIP/2.0 {status}").into_bytes()
+}
+
 /// SIP Dialog Identifier
 ///
 /// `DialogId` uniquely identifies a SIP dialog. According to RFC 3261, a dialog is
