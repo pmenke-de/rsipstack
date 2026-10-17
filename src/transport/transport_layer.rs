@@ -20,6 +20,7 @@ use crate::transport::connection::TransportReceiver;
 use crate::{transport::TransportEvent, Result};
 use async_trait::async_trait;
 use core::net::IpAddr;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{debug, info, warn};
 
 #[async_trait]
@@ -144,13 +145,31 @@ pub struct TransportLayerInner {
     tls_config: RwLock<Option<TlsConfig>>,
     #[cfg(all(feature = "platform-tokio", feature = "websocket"))]
     ws_path: RwLock<Option<String>>,
+    /// Live `TransportLayer` handles sharing this inner; the last one to
+    /// drop cancels `cancel_token`. Tasks holding only the inner `Arc`
+    /// (listeners, connections) do not count.
+    handles: AtomicUsize,
 }
 pub(crate) type TransportLayerInnerRef = Arc<TransportLayerInner>;
 
-#[derive(Clone)]
+/// The transport layer of an endpoint.
+///
+/// Clones share one layer. Dropping the last clone cancels the layer's
+/// cancel token, which stops its listeners and connections; dropping any
+/// other clone leaves the layer running.
 pub struct TransportLayer {
     pub outbound: Option<SipAddr>,
     pub inner: TransportLayerInnerRef,
+}
+
+impl Clone for TransportLayer {
+    fn clone(&self) -> Self {
+        self.inner.handles.fetch_add(1, Ordering::Relaxed);
+        Self {
+            outbound: self.outbound.clone(),
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl TransportLayer {
@@ -171,6 +190,7 @@ impl TransportLayer {
             tls_config: RwLock::new(None),
             #[cfg(all(feature = "platform-tokio", feature = "websocket"))]
             ws_path: RwLock::new(None),
+            handles: AtomicUsize::new(1),
         };
         Self {
             outbound: None,
@@ -539,7 +559,9 @@ fn retire_connection(connections: &RwMap<SipAddr, SipConnection>, connection: &S
 
 impl Drop for TransportLayer {
     fn drop(&mut self) {
-        self.inner.cancel_token.cancel();
+        if self.inner.handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.inner.cancel_token.cancel();
+        }
     }
 }
 #[cfg(all(test, feature = "platform-tokio"))]

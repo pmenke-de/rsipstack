@@ -127,3 +127,49 @@ async fn test_tls_listener_closed_on_cancel() -> Result<()> {
     assert_listener_closed_on_cancel(listener.into(), addr).await;
     Ok(())
 }
+
+/// Dropping a clone of a `TransportLayer` must leave the layer running: only
+/// the last clone cancels it.
+#[tokio::test]
+async fn test_dropping_a_clone_keeps_the_layer_running() -> Result<()> {
+    let addr = free_port();
+    let cancel = CancellationToken::new();
+    let transport_layer = TransportLayer::new(cancel.clone());
+    transport_layer.add_transport(TcpListenerConnection::new(addr, None).await?.into());
+    transport_layer.serve_listens().await?;
+
+    let clone = transport_layer.clone();
+    drop(clone);
+    assert!(
+        !cancel.is_cancelled(),
+        "dropping a clone cancelled the layer"
+    );
+    tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("listener accepts after a clone was dropped");
+
+    // A clone that outlives the original keeps the layer running, too.
+    let survivor = transport_layer.clone();
+    drop(transport_layer);
+    assert!(
+        !cancel.is_cancelled(),
+        "dropping the original cancelled the layer"
+    );
+    tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("listener accepts while a clone is alive");
+
+    // The last clone shuts the layer down.
+    drop(survivor);
+    assert!(
+        cancel.is_cancelled(),
+        "dropping the last clone left the layer running"
+    );
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(addr).await.is_err() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("listener on {addr} still accepting after the last clone was dropped");
+}
