@@ -19,8 +19,8 @@ use crate::transaction::key::TransactionKey;
 use crate::transport::connection::TransportReceiver;
 use crate::{transport::TransportEvent, Result};
 use async_trait::async_trait;
-use core::sync::atomic::{AtomicU32, Ordering};
 use core::net::IpAddr;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use tracing::{debug, info, warn};
 
 /// Default idle timeout applied to stream (TCP/TLS/WS) connections when the
@@ -161,13 +161,31 @@ pub struct TransportLayerInner {
     /// `0` disables the timeout (legacy behavior). See
     /// [`DEFAULT_STREAM_IDLE_TIMEOUT_MS`].
     stream_idle_timeout_ms: AtomicU32,
+    /// Live `TransportLayer` handles sharing this inner; the last one to
+    /// drop cancels `cancel_token`. Tasks holding only the inner `Arc`
+    /// (listeners, connections) do not count.
+    handles: AtomicUsize,
 }
 pub(crate) type TransportLayerInnerRef = Arc<TransportLayerInner>;
 
-#[derive(Clone)]
+/// The transport layer of an endpoint.
+///
+/// Clones share one layer. Dropping the last clone cancels the layer's
+/// cancel token, which stops its listeners and connections; dropping any
+/// other clone leaves the layer running.
 pub struct TransportLayer {
     pub outbound: Option<SipAddr>,
     pub inner: TransportLayerInnerRef,
+}
+
+impl Clone for TransportLayer {
+    fn clone(&self) -> Self {
+        self.inner.handles.fetch_add(1, Ordering::Relaxed);
+        Self {
+            outbound: self.outbound.clone(),
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl TransportLayer {
@@ -189,6 +207,7 @@ impl TransportLayer {
             #[cfg(all(feature = "platform-tokio", feature = "websocket"))]
             ws_path: RwLock::new(None),
             stream_idle_timeout_ms: AtomicU32::new(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
+            handles: AtomicUsize::new(1),
         };
         Self {
             outbound: None,
@@ -701,7 +720,9 @@ fn retire_connection(connections: &RwMap<SipAddr, Vec<SipConnection>>, connectio
 
 impl Drop for TransportLayer {
     fn drop(&mut self) {
-        self.inner.cancel_token.cancel();
+        if self.inner.handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.inner.cancel_token.cancel();
+        }
     }
 }
 #[cfg(all(test, feature = "platform-tokio"))]
