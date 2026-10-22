@@ -639,7 +639,7 @@ impl ServerInviteDialog {
             crate::sip::Header::ContentType("message/sipfrag".into()),
         ];
 
-        let body = format!("SIP/2.0 {} {:?}", u16::from(status.clone()), status).into_bytes();
+        let body = super::refer_sipfrag(&status);
 
         self.notify(Some(headers), Some(body)).await
     }

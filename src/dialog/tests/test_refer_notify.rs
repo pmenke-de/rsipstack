@@ -263,8 +263,8 @@ async fn test_refer_returns_dialog_to_confirmed_and_notify_works() -> crate::Res
                 "the NOTIFY must carry Subscription-State: active, got {text}"
             );
             assert!(
-                text.contains("SIP/2.0 100"),
-                "the NOTIFY body must carry the 100 Trying sipfrag, got {text}"
+                text.ends_with("\r\n\r\nSIP/2.0 100 Trying"),
+                "the NOTIFY body must be the 100 Trying sipfrag, got {text}"
             );
             // Answer the NOTIFY so the transaction completes.
             let header = |name: &str| {
@@ -291,4 +291,32 @@ async fn test_refer_returns_dialog_to_confirmed_and_notify_works() -> crate::Res
 
     token.cancel();
     Ok(())
+}
+
+/// The sipfrag carries the canonical reason phrase, not the status code's
+/// Rust variant name (`480 TemporarilyUnavailable`).
+#[test]
+fn test_refer_sipfrag_uses_the_reason_phrase() {
+    let body =
+        |status: StatusCode| String::from_utf8(crate::dialog::refer_sipfrag(&status)).unwrap();
+    assert_eq!(body(StatusCode::Trying), "SIP/2.0 100 Trying");
+    assert_eq!(body(StatusCode::OK), "SIP/2.0 200 OK");
+    assert_eq!(
+        body(StatusCode::TemporarilyUnavailable),
+        "SIP/2.0 480 Temporarily Unavailable"
+    );
+    assert_eq!(body(StatusCode::BusyHere), "SIP/2.0 486 Busy Here");
+    assert_eq!(
+        body(StatusCode::RequestTerminated),
+        "SIP/2.0 487 Request Terminated"
+    );
+    assert_eq!(
+        body(StatusCode::ServiceUnavailable),
+        "SIP/2.0 503 Service Unavailable"
+    );
+    // A code without a variant keeps the phrase it was built with.
+    assert_eq!(
+        body(StatusCode::Other(299, "Custom Thing".into())),
+        "SIP/2.0 299 Custom Thing"
+    );
 }
