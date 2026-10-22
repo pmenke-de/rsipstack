@@ -397,7 +397,7 @@ impl TlsListenerConnection {
         Ok(())
     }
 
-    async fn create_acceptor(
+    pub(crate) async fn create_acceptor(
         config: &TlsConfig,
     ) -> Result<(TlsAcceptor, Arc<ReloadableCertResolver>)> {
         let resolver = ReloadableCertResolver::new(
