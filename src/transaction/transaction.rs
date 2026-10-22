@@ -270,15 +270,22 @@ impl Transaction {
             }
         }
 
+        let mut connect_failed = false;
         let lookup_result = if self.connection.is_none() {
             let target_uri = self.resolve_target_uri().await?;
 
-            Some(
-                self.endpoint_inner
-                    .transport_layer
-                    .lookup(&target_uri, Some(&self.key))
-                    .await,
-            )
+            let result = self
+                .endpoint_inner
+                .transport_layer
+                .lookup(&target_uri, Some(&self.key))
+                .await;
+            if let Err(e) = &result {
+                if self.dials_stream(&target_uri) {
+                    warn!(key = %self.key, target = %target_uri, error = %e, "connect failed");
+                    connect_failed = true;
+                }
+            }
+            Some(result)
         } else {
             None
         };
@@ -290,7 +297,8 @@ impl Transaction {
             self.destination.replace(resolved_addr.clone());
         }
         // Failed lookups stay non-fatal (DNS failure → Calling + retry;
-        // see test_before_send).
+        // see test_before_send), except for a stream connection that could
+        // not be opened (below).
 
         // RFC 5626 flow affinity: when the request is bound to an existing
         // reliable connection (e.g. a WebSocket/WSS flow reused for in-dialog
@@ -339,13 +347,37 @@ impl Transaction {
         // even when transport is unavailable. Timer A will retry the send (and
         // redo the transport lookup if needed), and Timer B handles timeout.
         self.transition(TransactionState::Calling)?;
-        if stream_failed {
+        if stream_failed || connect_failed {
             self.on_stream_send_failure()?;
         }
         Ok(())
     }
 
-    /// A write on a stream connection (TCP/TLS/WS) failed. Nothing will ever
+    /// Whether reaching `target` opens a stream connection (TCP, TLS, WS,
+    /// WSS), directly or through the transport layer's outbound proxy. A
+    /// connection that cannot be opened (refused, failed TLS handshake) is
+    /// a transport error for the TU (RFC 3261 §8.1.3.1); retrying it on
+    /// Timer A would open a new connection on every tick until Timer B/F.
+    fn dials_stream(&self, target: &SipAddr) -> bool {
+        let dialed = self
+            .endpoint_inner
+            .transport_layer
+            .outbound
+            .as_ref()
+            .unwrap_or(target);
+        matches!(
+            dialed.r#type,
+            Some(
+                crate::sip::Transport::Tcp
+                    | crate::sip::Transport::Tls
+                    | crate::sip::Transport::Ws
+                    | crate::sip::Transport::Wss
+            )
+        )
+    }
+
+    /// A write on a stream connection (TCP/TLS/WS) failed, or the connection
+    /// could not be opened. Nothing will ever
     /// retransmit the request on it (no Timer A on reliable transports), so
     /// instead of leaving the TU to wait for Timer B/F: retire the dead
     /// connection, so later requests to the peer do not pick it again, and
@@ -1157,6 +1189,11 @@ impl Transaction {
                         // using the same target resolution rule as send()
                         if self.connection.is_none() {
                             if let Ok(target) = self.resolve_target_uri().await {
+                                // A stream connection that could not be
+                                // opened was reported to the TU by send().
+                                if self.dials_stream(&target) {
+                                    return Ok(());
+                                }
                                 if let Ok((connection, resolved_addr)) = self
                                     .endpoint_inner
                                     .transport_layer
