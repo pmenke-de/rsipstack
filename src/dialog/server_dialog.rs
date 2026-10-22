@@ -758,6 +758,14 @@ impl ServerInviteDialog {
             }
         }
 
+        if !self.inner.is_terminated()
+            && super::invite_dialog::is_early_dialog_request(&tx.original.method)
+        {
+            return super::invite_dialog::InviteDialog::from_inner(self.inner.clone())
+                .handle_early_request(tx)
+                .await;
+        }
+
         match tx.original.method {
             crate::sip::Method::Invite => return self.handle_invite(tx).await,
             crate::sip::Method::PRack => return self.handle_prack(tx).await,

@@ -46,6 +46,15 @@ pub struct InviteDialog {
     pub(super) inner: DialogInnerRef,
 }
 
+/// The requests an early dialog passes to the application (see
+/// `InviteDialog::handle_early_request`).
+pub(super) fn is_early_dialog_request(method: &Method) -> bool {
+    matches!(
+        method,
+        Method::Options | Method::Info | Method::Message | Method::Update
+    )
+}
+
 impl InviteDialog {
     pub fn from_inner(inner: DialogInnerRef) -> Self {
         Self { inner }
@@ -959,7 +968,13 @@ impl InviteDialog {
             }
         }
 
-        // Not confirmed — only the UAS side drives the INVITE transaction here.
+        // Not confirmed yet. Requests other than the INVITE's own may come
+        // in an early dialog on either role (RFC 3261 §12, RFC 3311 §5.1).
+        if !self.inner.is_terminated() && is_early_dialog_request(&tx.original.method) {
+            return self.handle_early_request(tx).await;
+        }
+
+        // Only the UAS side drives the INVITE transaction here.
         if self.role() == TransactionRole::Server {
             match tx.original.method {
                 Method::Invite => return self.handle_invite(tx).await,
@@ -980,6 +995,39 @@ impl InviteDialog {
             }
         }
         Ok(())
+    }
+
+    /// OPTIONS, INFO, MESSAGE or UPDATE in a dialog that is not confirmed:
+    /// raised to the application as in a confirmed dialog, which answers
+    /// through the handle; the dialog keeps its state. An UPDATE with an
+    /// offer while the offer in our INVITE has no answer is rejected with
+    /// 491 (RFC 3311 §5.2).
+    pub(super) async fn handle_early_request(&mut self, tx: &mut Transaction) -> Result<()> {
+        let method = tx.original.method;
+        debug!(id = %self.id(), %method, state = %self.inner.state.lock(), "received request in early dialog");
+        if method == Method::Update && !tx.original.body.is_empty() && self.offer_pending() {
+            debug!(id = %self.id(), "update with an offer while ours is unanswered");
+            tx.reply(StatusCode::RequestPending).await?;
+            return Ok(());
+        }
+        let (handle, rx) = TransactionHandle::new();
+        let (id, request) = (self.id(), tx.original.clone());
+        let event = match method {
+            Method::Options => DialogState::Options(id, request, handle),
+            Method::Info => DialogState::Info(id, request, handle),
+            Method::Message => DialogState::Message(id, request, handle),
+            _ => DialogState::Updated(id, request, handle),
+        };
+        self.inner.transition(event);
+        self.inner.process_transaction_handle(tx, rx).await
+    }
+
+    /// The UAC's INVITE carried an offer and no provisional response has
+    /// carried the answer yet.
+    fn offer_pending(&self) -> bool {
+        self.role() == TransactionRole::Client
+            && !self.inner.initial_request.lock().body.is_empty()
+            && !self.inner.early_answer.load(Ordering::Relaxed)
     }
 
     async fn handle_bye(&mut self, tx: &mut Transaction) -> Result<()> {
