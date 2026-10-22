@@ -313,3 +313,132 @@ async fn test_reload_tls_config_reaches_handshake() -> Result<()> {
     cancel.cancel();
     Ok(())
 }
+
+/// A client that connects and never sends a ClientHello is dropped after
+/// `TlsConfig::handshake_timeout`, and the listener keeps accepting while
+/// that connection waits.
+#[cfg(feature = "rustls")]
+#[tokio::test]
+async fn test_tls_handshake_timeout_drops_silent_client() -> Result<()> {
+    use crate::transport::{TlsConfig, TlsListenerConnection, TransportLayer};
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, SignatureScheme};
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::sync::CancellationToken;
+
+    /// Accepts any certificate: the test is about timing, not trust.
+    #[derive(Debug)]
+    struct AcceptAny(Vec<SignatureScheme>);
+
+    impl ServerCertVerifier for AcceptAny {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.clone()
+        }
+    }
+
+    const TIMEOUT: Duration = Duration::from_secs(1);
+
+    let (cert, key) = generate_test_cert("localhost")?;
+    let addr = {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        probe.local_addr()?
+    };
+    let cancel = CancellationToken::new();
+    let transport_layer = TransportLayer::new(cancel.clone());
+    let listener = TlsListenerConnection::new(
+        addr,
+        None,
+        TlsConfig {
+            cert: Some(cert.into_bytes()),
+            key: Some(key.into_bytes()),
+            handshake_timeout: Some(TIMEOUT),
+            ..Default::default()
+        },
+    )
+    .await?;
+    listener
+        .serve_listener(transport_layer.inner.clone())
+        .await?;
+
+    // Connects and sends nothing.
+    let started = Instant::now();
+    let mut silent = tokio::net::TcpStream::connect(addr).await?;
+
+    // While it waits, a proper client still completes its handshake ...
+    let provider = get_test_provider();
+    let schemes = provider
+        .signature_verification_algorithms
+        .supported_schemes();
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| crate::Error::Error(e.to_string()))?
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    config
+        .dangerous()
+        .set_certificate_verifier(Arc::new(AcceptAny(schemes)));
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(addr).await?;
+    let mut tls = tokio::time::timeout(
+        Duration::from_secs(5),
+        connector.connect(ServerName::try_from("localhost").unwrap(), tcp),
+    )
+    .await
+    .expect("handshake of the second client timed out")?;
+    // ... and the silent one is still open at that point.
+    let mut probe = [0u8; 1];
+    assert!(
+        matches!(silent.try_read(&mut probe), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "the silent connection was closed before the second handshake ended"
+    );
+    tls.shutdown().await.ok();
+
+    // The silent client is closed by the server once the timeout passed.
+    let mut buf = [0u8; 16];
+    let read = tokio::time::timeout(Duration::from_secs(5), silent.read(&mut buf))
+        .await
+        .expect("the silent connection was not closed");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "the server sent data to a client without ClientHello: {read:?}"
+    );
+    assert!(
+        started.elapsed() >= TIMEOUT,
+        "closed before the handshake timeout: {:?}",
+        started.elapsed()
+    );
+
+    cancel.cancel();
+    Ok(())
+}
