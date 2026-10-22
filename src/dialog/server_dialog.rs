@@ -3,7 +3,7 @@ use super::subscription::ServerSubscriptionDialog;
 use super::DialogId;
 use crate::platform::CancellationToken;
 use crate::prelude::*;
-use crate::sip::{prelude::HeadersExt, Header, Method, Request, SipMessage, StatusCode};
+use crate::sip::{prelude::HeadersExt, Header, Request, SipMessage, StatusCode};
 use crate::{
     transaction::transaction::{Transaction, TransactionEvent},
     Result,
@@ -130,6 +130,41 @@ impl ServerInviteDialog {
         self.inner.initial_request.lock().clone()
     }
 
+    /// See [`InviteDialog::supports_100rel`](super::invite_dialog::InviteDialog::supports_100rel).
+    pub fn supports_100rel(&self) -> bool {
+        self.inner.supports_100rel
+    }
+
+    /// See [`InviteDialog::requires_100rel`](super::invite_dialog::InviteDialog::requires_100rel).
+    pub fn requires_100rel(&self) -> bool {
+        self.inner.requires_100rel()
+    }
+
+    /// Send a provisional response reliably (RFC 3262 §3); see
+    /// [`InviteDialog::reliable_provisional`](super::invite_dialog::InviteDialog::reliable_provisional).
+    pub fn reliable_provisional(
+        &self,
+        status: StatusCode,
+        headers: Option<Vec<Header>>,
+        body: Option<Vec<u8>>,
+    ) -> Result<()> {
+        self.inner.send_reliable_provisional(status, headers, body)
+    }
+
+    /// See [`InviteDialog::ringing_reliable`](super::invite_dialog::InviteDialog::ringing_reliable).
+    pub fn ringing_reliable(
+        &self,
+        headers: Option<Vec<Header>>,
+        body: Option<Vec<u8>>,
+    ) -> Result<()> {
+        let status = if body.is_some() {
+            StatusCode::SessionProgress
+        } else {
+            StatusCode::Ringing
+        };
+        self.reliable_provisional(status, headers, body)
+    }
+
     pub fn ringing(&self, headers: Option<Vec<Header>>, body: Option<Vec<u8>>) -> Result<()> {
         if !self.inner.can_cancel() {
             return Ok(());
@@ -189,6 +224,11 @@ impl ServerInviteDialog {
             headers,
             body,
         );
+        // Held back while a reliable 1xx with a body waits for its PRACK
+        // (see `InviteDialog::accept`).
+        if !self.inner.release_final_response(&resp) {
+            return Ok(());
+        }
         self.inner
             .tu_sender
             .send(TransactionEvent::Respond(resp.clone()))?;
@@ -304,6 +344,7 @@ impl ServerInviteDialog {
             headers,
             None,
         );
+        self.inner.release_final_response(&resp);
         self.inner
             .tu_sender
             .send(TransactionEvent::Respond(resp))
@@ -767,28 +808,7 @@ impl ServerInviteDialog {
 
     async fn handle_prack(&mut self, tx: &mut Transaction) -> Result<()> {
         debug!(id = %self.id(), uri = %tx.original.uri, "received prack");
-
-        let rack_ok = tx.original.rack_value().is_some()
-            || tx
-                .original
-                .header_value("RAck")
-                .and_then(|value| {
-                    let mut items = value.split_whitespace();
-                    let rseq = items.next()?.parse::<u32>().ok()?;
-                    let cseq = items.next()?.parse::<u32>().ok()?;
-                    let method = items.next()?.parse::<Method>().ok()?;
-                    Some((rseq, cseq, method))
-                })
-                .is_some();
-
-        if !rack_ok {
-            warn!(id = %self.id(), "received PRACK without RAck header");
-            tx.reply(crate::sip::StatusCode::BadRequest).await?;
-            return Ok(());
-        }
-
-        tx.reply(crate::sip::StatusCode::OK).await?;
-        Ok(())
+        self.inner.handle_prack(tx).await
     }
 
     async fn handle_options(&mut self, tx: &mut Transaction) -> Result<()> {
