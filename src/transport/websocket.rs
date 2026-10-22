@@ -1,6 +1,8 @@
 use crate::platform::CancellationToken;
 use crate::sip::SipMessage;
 use crate::transport::tcp_listener::accept_or_cancelled;
+#[cfg(feature = "rustls")]
+use crate::transport::tls::{ReloadableCertResolver, TlsConfig, TlsListenerConnection};
 use crate::{
     transport::{
         connection::{TransportSender, KEEPALIVE_REQUEST, KEEPALIVE_RESPONSE},
@@ -11,35 +13,126 @@ use crate::{
     },
     Result,
 };
-use futures_util::{SinkExt, StreamExt};
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{fmt, net::SocketAddr, sync::Arc};
-use tokio::{net::TcpListener, sync::Mutex};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::Mutex,
+};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{
         client::IntoClientRequest,
-        handshake::server::{Request, Response},
+        handshake::server::{ErrorResponse, Request, Response},
         protocol::Message,
     },
     MaybeTlsStream, WebSocketStream,
 };
 use tracing::{debug, info, warn};
 
-// Define a type alias for the WebSocket sink to make the code more readable
-type WsSink = futures_util::stream::SplitSink<
-    WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-    Message,
->;
-type WsRead =
-    futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>;
+/// A WebSocket over plain TCP, or over TLS that this side started as the
+/// client (`MaybeTlsStream`).
+type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
+/// A WebSocket over TLS that a secure listener accepted as the server.
+#[cfg(feature = "rustls")]
+type ServerTlsWs = WebSocketStream<tokio_rustls::server::TlsStream<TcpStream>>;
+
+/// The sending half of a WebSocket connection. `MaybeTlsStream` has no
+/// server-side TLS variant, so a connection a secure listener accepted
+/// has a stream type of its own.
+pub enum WsSink {
+    Plain(SplitSink<PlainWs, Message>),
+    #[cfg(feature = "rustls")]
+    ServerTls(SplitSink<ServerTlsWs, Message>),
+}
+
+impl WsSink {
+    pub async fn send(
+        &mut self,
+        msg: Message,
+    ) -> core::result::Result<(), tokio_tungstenite::tungstenite::Error> {
+        match self {
+            WsSink::Plain(sink) => sink.send(msg).await,
+            #[cfg(feature = "rustls")]
+            WsSink::ServerTls(sink) => sink.send(msg).await,
+        }
+    }
+}
+
+impl From<SplitSink<PlainWs, Message>> for WsSink {
+    fn from(sink: SplitSink<PlainWs, Message>) -> Self {
+        WsSink::Plain(sink)
+    }
+}
+
+/// The receiving half of a WebSocket connection (see [`WsSink`]).
+pub enum WsRead {
+    Plain(SplitStream<PlainWs>),
+    #[cfg(feature = "rustls")]
+    ServerTls(SplitStream<ServerTlsWs>),
+}
+
+impl WsRead {
+    pub async fn next(
+        &mut self,
+    ) -> Option<core::result::Result<Message, tokio_tungstenite::tungstenite::Error>> {
+        match self {
+            WsRead::Plain(read) => read.next().await,
+            #[cfg(feature = "rustls")]
+            WsRead::ServerTls(read) => read.next().await,
+        }
+    }
+}
+
+impl From<SplitStream<PlainWs>> for WsRead {
+    fn from(read: SplitStream<PlainWs>) -> Self {
+        WsRead::Plain(read)
+    }
+}
+
+/// How long a new connection to a WebSocket listener has for its TLS
+/// handshake (secure listener) and its WebSocket upgrade together.
+pub const DEFAULT_UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Answers a client that asks for the `sip` subprotocol (RFC 7118) with it.
+#[allow(clippy::result_large_err)] // tungstenite's callback signature
+fn sip_subprotocol(
+    req: &Request,
+    mut response: Response,
+) -> core::result::Result<Response, ErrorResponse> {
+    if let Some(protocols) = req.headers().get("sec-websocket-protocol") {
+        if let Ok(protocols_str) = protocols.to_str() {
+            if protocols_str.contains("sip") {
+                response
+                    .headers_mut()
+                    .insert("sec-websocket-protocol", "sip".parse().unwrap());
+            }
+        }
+    }
+    Ok(response)
+}
 
 // WebSocket Listener Connection Structure
 pub struct WebSocketListenerConnectionInner {
     pub local_addr: SipAddr,
     pub external: Option<SipAddr>,
     pub is_secure: bool,
+    /// The TLS a secure listener terminates itself (`new_tls`). `None` for
+    /// a plain listener, and for a secure one whose TLS ends in front of
+    /// it (a proxy): `is_secure` then only names the transport.
+    #[cfg(feature = "rustls")]
+    pub tls_config: Option<TlsConfig>,
+    /// The acceptor's certificate resolver, for `reload_tls_config`; set
+    /// when the listener starts.
+    #[cfg(feature = "rustls")]
+    pub cert_resolver: crate::platform::sync::Mutex<Option<Arc<ReloadableCertResolver>>>,
+    /// Bound for the TLS handshake and WebSocket upgrade of a new
+    /// connection, in milliseconds (see `set_upgrade_timeout`).
+    pub upgrade_timeout_ms: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -69,10 +162,70 @@ impl WebSocketListenerConnection {
                 addr: addr.into(),
             }),
             is_secure,
+            #[cfg(feature = "rustls")]
+            tls_config: None,
+            #[cfg(feature = "rustls")]
+            cert_resolver: crate::platform::sync::Mutex::new(None),
+            upgrade_timeout_ms: AtomicU64::new(DEFAULT_UPGRADE_TIMEOUT.as_millis() as u64),
         };
         Ok(WebSocketListenerConnection {
             inner: Arc::new(inner),
         })
+    }
+
+    /// A secure WebSocket listener (`wss://`, transport `WSS`) that runs the
+    /// TLS handshake itself with the certificate and key of `config`, like
+    /// `TlsListenerConnection`; `reload_tls_config` replaces them for later
+    /// handshakes.
+    #[cfg(feature = "rustls")]
+    pub async fn new_tls(
+        local_addr: SocketAddr,
+        external: Option<SocketAddr>,
+        config: TlsConfig,
+    ) -> Result<Self> {
+        let transport_type = crate::sip::transport::Transport::Wss;
+        let inner = WebSocketListenerConnectionInner {
+            local_addr: SipAddr {
+                r#type: Some(transport_type),
+                addr: local_addr.into(),
+            },
+            external: external.map(|addr| SipAddr {
+                r#type: Some(transport_type),
+                addr: addr.into(),
+            }),
+            is_secure: true,
+            tls_config: Some(config),
+            cert_resolver: crate::platform::sync::Mutex::new(None),
+            upgrade_timeout_ms: AtomicU64::new(DEFAULT_UPGRADE_TIMEOUT.as_millis() as u64),
+        };
+        Ok(WebSocketListenerConnection {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// Bounds the TLS handshake and WebSocket upgrade of every connection
+    /// accepted from now on (default [`DEFAULT_UPGRADE_TIMEOUT`]); a client
+    /// that has not completed both by then is closed.
+    pub fn set_upgrade_timeout(&self, timeout: Duration) {
+        let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        self.inner.upgrade_timeout_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Replaces the certificate and key of a listener made with `new_tls`;
+    /// handshakes from then on present the new pair, open connections keep
+    /// theirs.
+    #[cfg(feature = "rustls")]
+    pub async fn reload_tls_config(&self, cert: Vec<u8>, key: Vec<u8>) -> Result<()> {
+        let resolver = {
+            let guard = self.inner.cert_resolver.lock();
+            guard
+                .as_ref()
+                .ok_or_else(|| crate::Error::Error("No cert resolver available".to_string()))?
+                .clone()
+        };
+        resolver
+            .reload(&cert, &key)
+            .map_err(|e| crate::Error::Error(e.to_string()))
     }
 
     pub async fn serve_listener(
@@ -99,6 +252,16 @@ impl WebSocketListenerConnection {
             crate::sip::transport::Transport::Ws
         };
         let listener_local_addr = self.get_addr().clone();
+        #[cfg(feature = "rustls")]
+        let acceptor = match &self.inner.tls_config {
+            Some(config) => {
+                let (acceptor, resolver) = TlsListenerConnection::create_acceptor(config).await?;
+                *self.inner.cert_resolver.lock() = Some(resolver);
+                Some(acceptor)
+            }
+            None => None,
+        };
+        let listener_inner = self.inner.clone();
 
         debug!(local = %self.inner.local_addr, "Starting WebSocket listener");
         crate::platform::spawn(async move {
@@ -129,40 +292,49 @@ impl WebSocketListenerConnection {
                 };
                 let transport_layer_inner_ref = transport_layer_inner.clone();
                 let local_addr = listener_local_addr.clone();
+                #[cfg(feature = "rustls")]
+                let acceptor = acceptor.clone();
+                let upgrade_timeout = Duration::from_millis(
+                    listener_inner.upgrade_timeout_ms.load(Ordering::Relaxed),
+                );
                 crate::platform::spawn(async move {
-                    // Wrap the TCP stream in MaybeTlsStream
-                    let maybe_tls_stream = MaybeTlsStream::Plain(stream);
-
-                    // Accept the WebSocket connection with custom header handling
-                    let callback = |req: &Request, mut response: Response| {
-                        // Check if client requested 'sip' subprotocol
-                        if let Some(protocols) = req.headers().get("sec-websocket-protocol") {
-                            if let Ok(protocols_str) = protocols.to_str() {
-                                if protocols_str.contains("sip") {
-                                    // Add the 'sip' subprotocol to response
-                                    response
-                                        .headers_mut()
-                                        .insert("sec-websocket-protocol", "sip".parse().unwrap());
-                                }
-                            }
+                    let upgrade = async {
+                        #[cfg(feature = "rustls")]
+                        if let Some(acceptor) = acceptor {
+                            let tls_stream = acceptor
+                                .accept(stream)
+                                .await
+                                .map_err(|e| format!("TLS handshake failed: {}", e))?;
+                            let ws =
+                                tokio_tungstenite::accept_hdr_async(tls_stream, sip_subprotocol)
+                                    .await
+                                    .map_err(|e| format!("Error upgrading to WebSocket: {}", e))?;
+                            let (sink, read) = ws.split();
+                            return Ok((WsSink::ServerTls(sink), WsRead::ServerTls(read)));
                         }
-                        Ok(response)
+                        let ws = tokio_tungstenite::accept_hdr_async(
+                            MaybeTlsStream::Plain(stream),
+                            sip_subprotocol,
+                        )
+                        .await
+                        .map_err(|e| format!("Error upgrading to WebSocket: {}", e))?;
+                        let (sink, read) = ws.split();
+                        Ok::<_, String>((WsSink::from(sink), WsRead::from(read)))
                     };
-
-                    let ws_stream = match tokio_tungstenite::accept_hdr_async(
-                        maybe_tls_stream,
-                        callback,
-                    )
-                    .await
+                    let (ws_sink, ws_read) = match tokio::time::timeout(upgrade_timeout, upgrade)
+                        .await
                     {
-                        Ok(ws) => ws,
-                        Err(e) => {
-                            warn!(error = %e, remote = %remote_addr, "Error upgrading to WebSocket");
+                        Ok(Ok(halves)) => halves,
+                        Ok(Err(e)) => {
+                            warn!(error = %e, remote = %remote_addr, "WebSocket connection not accepted");
+                            return;
+                        }
+                        Err(_) => {
+                            debug!(remote = %remote_addr, "WebSocket upgrade timed out");
                             return;
                         }
                     };
 
-                    let (ws_sink, ws_read) = ws_stream.split();
                     let connection = WebSocketConnection {
                         inner: Arc::new(WebSocketInner {
                             local_addr,
@@ -271,8 +443,8 @@ impl WebSocketConnection {
             inner: Arc::new(WebSocketInner {
                 local_addr,
                 remote_addr: remote.clone(),
-                ws_sink: Mutex::new(ws_sink),
-                ws_read: Mutex::new(Some(ws_stream)),
+                ws_sink: Mutex::new(ws_sink.into()),
+                ws_read: Mutex::new(Some(ws_stream.into())),
             }),
             cancel_token,
         };

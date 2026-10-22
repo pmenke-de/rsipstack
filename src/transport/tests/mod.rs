@@ -7,3 +7,5 @@ pub mod test_tls_log_levels;
 pub mod test_tls_reload;
 pub mod test_udp;
 pub mod test_via_received;
+#[cfg(all(feature = "rustls", feature = "websocket"))]
+pub mod test_wss_listener;
