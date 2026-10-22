@@ -254,6 +254,19 @@ where
                         }
                     }
                 }
+                // A TLS peer that closes the TCP connection without
+                // close_notify (a client that quits) reads as UnexpectedEof,
+                // or as ConnectionReset when our last records were unread:
+                // the end of the connection, not a fault.
+                StreamRead::Data(Err(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    debug!(error = %e, src = %remote_addr, "Error reading from stream, peer closed");
+                    break;
+                }
                 StreamRead::Data(Err(e)) => {
                     warn!(error = %e, src = %remote_addr, "Error reading from stream");
                     break;
