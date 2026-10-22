@@ -17,6 +17,7 @@ mod test_server;
 mod test_server_cancel;
 mod test_server_invite_ack;
 mod test_server_invite_drop;
+mod test_stream_connect_failure;
 mod test_stream_reconnect;
 mod test_transaction_states;
 
