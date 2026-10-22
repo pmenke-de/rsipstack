@@ -558,12 +558,22 @@ pub fn parse_uri(s: &str) -> Result<Uri, Error> {
         (None, host_part)
     };
 
+    // RFC 3986 §3 / RFC 3261 §19.1.1: a URI starts with its scheme.
+    let Some(scheme) = scheme else {
+        return Err(Error::ParseError(format!("URI without a scheme: {}", s)));
+    };
     let (auth, host_str) = if let Some(at) = user_host.rfind('@') {
         (Some(Auth::from(&user_host[..at])), &user_host[at + 1..])
     } else {
         (None, user_host)
     };
 
+    if host_str
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(Error::ParseError(format!("invalid host in URI: {}", s)));
+    }
     let host_with_port = parse_host_with_port(host_str)?;
 
     let params = parse_params(params_str.unwrap_or(""))?;
@@ -582,7 +592,7 @@ pub fn parse_uri(s: &str) -> Result<Uri, Error> {
     };
 
     Ok(Uri {
-        scheme,
+        scheme: Some(scheme),
         auth,
         host_with_port,
         params,
@@ -974,6 +984,33 @@ mod tests {
             uri.to_string(),
             "sip:alice@restsend.com;transport=TCP;tag=1928301774"
         );
+    }
+
+    #[test]
+    fn uri_without_a_scheme_is_rejected() {
+        for s in [
+            "not a uri",
+            "alice@example.com",
+            "example.com",
+            "192.0.2.1:5060",
+            "<alice@example.com>",
+        ] {
+            assert!(parse_uri(s).is_err(), "{s:?} was accepted");
+            assert!(super::Uri::try_from(s).is_err(), "{s:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn uri_with_whitespace_in_the_host_is_rejected() {
+        for s in [
+            "sip:not a uri",
+            "sip:bob@exa mple.com",
+            "sip:bob@example.com\t:5060",
+        ] {
+            assert!(parse_uri(s).is_err(), "{s:?} was accepted");
+        }
+        // Whitespace around the URI is still trimmed.
+        assert!(parse_uri("  sip:bob@example.com  ").is_ok());
     }
 
     #[test]
