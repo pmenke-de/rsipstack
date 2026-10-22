@@ -23,7 +23,7 @@ use tokio_rustls::{
     rustls::{pki_types, pki_types::pem::PemObject, ClientConfig, RootCertStore, ServerConfig},
     TlsAcceptor, TlsConnector,
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Certificate info extracted from PEM for logging purposes
 #[derive(Debug)]
@@ -190,7 +190,7 @@ impl ReloadableCertResolver {
 
         let mut guard = self.key_and_cert.write();
         guard.certified_key = certified_key;
-        warn!(
+        info!(
             "TLS certificate reloaded successfully [{}, {}]",
             sni_info, expires_info
         );
