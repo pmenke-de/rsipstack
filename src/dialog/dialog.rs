@@ -312,6 +312,10 @@ pub struct DialogInner {
     pub remote_contact: Mutex<Option<crate::sip::headers::untyped::Contact>>,
 
     pub remote_seq: AtomicU32,
+    /// A provisional response to this UAC dialog's INVITE carried a body,
+    /// the answer to the INVITE's offer: an UPDATE with a new offer can be
+    /// taken in the early dialog (RFC 3311 §5.2).
+    pub(super) early_answer: AtomicBool,
     pub remote_uri: Mutex<crate::sip::Uri>,
 
     pub from: crate::sip::typed::From,
@@ -490,6 +494,7 @@ impl DialogInner {
             local_seq: AtomicU32::new(cseq),
             remote_uri: Mutex::new(remote_uri),
             remote_seq: AtomicU32::new(0),
+            early_answer: AtomicBool::new(false),
             credential,
             route_set: Mutex::new(route_set),
             endpoint_inner,
@@ -673,6 +678,12 @@ impl DialogInner {
             self.update_remote_tag(tag.value())?;
         }
 
+        // RFC 3311 §5.1 asks for the answer in a reliable response; an
+        // unreliable 183 with SDP counts as well, as UAs that do not
+        // support 100rel send their answer that way and then UPDATE.
+        if !resp.body.is_empty() {
+            self.early_answer.store(true, Ordering::Relaxed);
+        }
         if let Some(prack) = self.prepare_prack_request(resp)? {
             let _ = self.send_prack_request(prack).await?;
         }
@@ -1554,6 +1565,7 @@ impl DialogInner {
 
             local_seq: AtomicU32::new(snapshot.local_cseq),
             remote_seq: AtomicU32::new(snapshot.remote_cseq),
+            early_answer: AtomicBool::new(false),
 
             local_contact: snapshot.local_contact,
             remote_uri: Mutex::new(snapshot.remote_uri),
@@ -1700,6 +1712,7 @@ impl DialogInner {
         // In-dialog request events do not change the established lifecycle state.
         match state {
             DialogState::Updated(_, _, _)
+            | DialogState::Message(_, _, _)
             | DialogState::Notify(_, _, _)
             | DialogState::Info(_, _, _)
             | DialogState::Options(_, _, _)
